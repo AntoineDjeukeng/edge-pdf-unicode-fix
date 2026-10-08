@@ -1,0 +1,83 @@
+diff --git a/core/fpdfdoc/cpdf_generateap.cpp b/core/fpdfdoc/cpdf_generateap.cpp
+index 8c920b6..14117a7 100644
+--- a/core/fpdfdoc/cpdf_generateap.cpp
++++ b/core/fpdfdoc/cpdf_generateap.cpp
+@@ -1108,7 +1108,14 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+     appearance_stream << "q\n" << border_stream << "Q\n";
+   }
+ 
+-  CPVT_FontMap map(doc, nullptr, std::move(default_font), font_name);
++  auto graphics_state_dict =
++      GenerateExtGStateDict(*annot_dict, "Normal");
++  auto resource_font_dict =
++      GenerateResourceFontDict(doc, font_name, font_dict->GetObjNum());
++  auto resource_dict = GenerateResourcesDict(
++      doc, std::move(graphics_state_dict), std::move(resource_font_dict));
++
++  CPVT_FontMap map(doc, resource_dict, std::move(default_font), font_name);
+   CPVT_VariableText::Provider provider(&map);
+   CPVT_VariableText vt(&provider);
+ 
+@@ -1137,11 +1144,6 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+                       << "Q\nEMC\n";
+   }
+ 
+-  auto graphics_state_dict = GenerateExtGStateDict(*annot_dict, "Normal");
+-  auto resource_font_dict =
+-      GenerateResourceFontDict(doc, font_name, font_dict->GetObjNum());
+-  auto resource_dict = GenerateResourcesDict(
+-      doc, std::move(graphics_state_dict), std::move(resource_font_dict));
+   GenerateAndSetAPDict(doc, annot_dict, &appearance_stream,
+                        std::move(resource_dict),
+                        /*is_text_markup_annotation=*/false);
+diff --git a/core/fpdfdoc/cpvt_fontmap.cpp b/core/fpdfdoc/cpvt_fontmap.cpp
+index 7f3ef70..ba16059 100644
+--- a/core/fpdfdoc/cpvt_fontmap.cpp
++++ b/core/fpdfdoc/cpvt_fontmap.cpp
+@@ -6,9 +6,12 @@
+ 
+ #include "core/fpdfdoc/cpvt_fontmap.h"
+ 
++#include <memory>
++
+ #include <utility>
+ 
+ #include "core/fpdfapi/font/cpdf_font.h"
++#include "core/fpdfapi/page/cpdf_docpagedata.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
+@@ -17,6 +20,7 @@
+ #include "core/fxcrt/check.h"
+ #include "core/fxcrt/fx_codepage.h"
+ #include "core/fxcrt/notreached.h"
++#include "core/fxge/cfx_font.h"
+ 
+ CPVT_FontMap::CPVT_FontMap(CPDF_Document* doc,
+                            RetainPtr<CPDF_Dictionary> pResDict,
+@@ -37,6 +41,25 @@ void CPVT_FontMap::SetupAnnotSysPDFFont() {
+   RetainPtr<CPDF_Font> pPDFFont =
+       CPDF_InteractiveForm::AddNativeInteractiveFormFont(document_,
+                                                          &sys_font_alias_);
++
++  if (!pPDFFont) {
++    constexpr FX_Charset kFallbackCharset =
++        FX_Charset::kMSWin_EasternEuropean;
++
++    auto fallback_font = std::make_unique<CFX_Font>();
++    fallback_font->LoadSubstFace(
++        CFX_Font::GetDefaultFontNameByCharset(kFallbackCharset),
++        true, 0, 0, 0,
++        FX_GetCodePageFromCharset(kFallbackCharset), false);
++
++    pPDFFont = CPDF_DocPageData::FromDocument(document_)->AddFont(
++        std::move(fallback_font), kFallbackCharset);
++
++    if (pPDFFont) {
++      sys_font_alias_ = "FallbackEE";
++    }
++  }
++
+   if (!pPDFFont) {
+     return;
+   }
