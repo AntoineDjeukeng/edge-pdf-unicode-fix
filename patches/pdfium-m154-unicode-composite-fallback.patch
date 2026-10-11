@@ -1,0 +1,259 @@
+diff --git a/core/fpdfdoc/cpdf_generateap.cpp b/core/fpdfdoc/cpdf_generateap.cpp
+index 546f463ec..000000000 100644
+--- a/core/fpdfdoc/cpdf_generateap.cpp
++++ b/core/fpdfdoc/cpdf_generateap.cpp
+@@ -1112,7 +1112,13 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+     appearance_stream << "q\n" << border_stream << "Q\n";
+   }
+ 
+-  CPVT_FontMap map(doc, nullptr, std::move(default_font), font_name);
++  // The font map must receive the same resource dictionary that will be
++  // attached to the generated appearance stream. Otherwise fallback fonts
++  // selected while laying out FreeText cannot be referenced from /AP.
++  auto graphics_state_dict = GenerateExtGStateDict(*annot_dict, "Normal");
++  auto resource_font_dict =
++      GenerateResourceFontDict(doc, font_name, font_dict->GetObjNum());
++  auto resource_dict = GenerateResourcesDict(
++      doc, std::move(graphics_state_dict), std::move(resource_font_dict));
++  CPVT_FontMap map(doc, resource_dict, std::move(default_font), font_name);
+   CPVT_VariableText::Provider provider(&map);
+   CPVT_VariableText vt(&provider);
+ 
+@@ -1141,11 +1147,6 @@ bool GenerateFreeTextAP(CPDF_Document* doc, CPDF_Dictionary* annot_dict) {
+                       << "Q\nEMC\n";
+   }
+ 
+-  auto graphics_state_dict = GenerateExtGStateDict(*annot_dict, "Normal");
+-  auto resource_font_dict =
+-      GenerateResourceFontDict(doc, font_name, font_dict->GetObjNum());
+-  auto resource_dict = GenerateResourcesDict(
+-      doc, std::move(graphics_state_dict), std::move(resource_font_dict));
+   GenerateAndSetAPDict(doc, annot_dict, &appearance_stream,
+                        std::move(resource_dict),
+                        /*is_text_markup_annotation=*/false);
+diff --git a/core/fpdfdoc/cpvt_fontmap.cpp b/core/fpdfdoc/cpvt_fontmap.cpp
+index 7f3ef705c..000000000 100644
+--- a/core/fpdfdoc/cpvt_fontmap.cpp
++++ b/core/fpdfdoc/cpvt_fontmap.cpp
+@@ -10,17 +10,160 @@
+ 
+ #include "core/fpdfdoc/cpvt_fontmap.h"
+ 
++#include <map>
++#include <memory>
+ #include <utility>
+ 
++#include "constants/catalog.h"
++#include "core/fpdfapi/edit/cpdf_font_util.h"
+ #include "core/fpdfapi/font/cpdf_font.h"
++#include "core/fpdfapi/page/cpdf_docpagedata.h"
++#include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+ #include "core/fpdfapi/parser/cpdf_document.h"
++#include "core/fpdfapi/parser/cpdf_name.h"
++#include "core/fpdfapi/parser/cpdf_number.h"
+ #include "core/fpdfapi/parser/cpdf_reference.h"
++#include "core/fpdfapi/parser/cpdf_stream.h"
++#include "core/fpdfapi/parser/cpdf_string.h"
+ #include "core/fpdfapi/parser/fpdf_parser_utility.h"
+ #include "core/fpdfdoc/cpdf_interactiveform.h"
+ #include "core/fxcrt/check.h"
+ #include "core/fxcrt/fx_codepage.h"
++#include "core/fxcrt/numerics/safe_conversions.h"
+ #include "core/fxcrt/notreached.h"
++#include "core/fxcrt/span.h"
++#include "core/fxcrt/utf16.h"
++#include "core/fxge/cfx_font.h"
++#include "core/fxge/fx_font.h"
++
++namespace {
++
++constexpr char kUnicodeFallbackAlias[] = "FallbackUnicode";
++
++std::unique_ptr<CFX_Font> LoadUnicodeFallbackFace() {
++  // Prefer fonts that are normally available on Linux and that cover both
++  // Central-European Latin and common Unicode symbols. FontMapper may still
++  // substitute an installed equivalent when an exact family is unavailable.
++  static constexpr const char* kCandidates[] = {
++      "DejaVu Sans",
++      "Noto Sans",
++      "Arial Unicode MS",
++  };
++
++  const FX_CodePage code_page =
++      FX_GetCodePageFromCharset(FX_Charset::kANSI);
++
++  for (const char* family : kCandidates) {
++    auto font = std::make_unique<CFX_Font>();
++    font->LoadSubstFace(family, /*bTrueType=*/true, /*flags=*/0,
++                        /*weight=*/0, /*italic_angle=*/0, code_page,
++                        /*bVertical=*/false);
++    if (!font->HasAnyGlyphs() || !font->IsTTFont() ||
++        font->GetFontSpan().empty()) {
++      continue;
++    }
++
++    // Require representative glyphs from both problem classes. This avoids
++    // accidentally accepting a narrow substitute font.
++    if (font->GetCharIndex(0x011B) == 0 ||  // LATIN SMALL LETTER E WITH CARON
++        font->GetCharIndex(0x2639) == 0) {  // WHITE FROWNING FACE
++      continue;
++    }
++    return font;
++  }
++  return nullptr;
++}
++
++RetainPtr<CPDF_Font> CreateUnicodeCompositeFallbackFont(CPDF_Document* doc) {
++  std::unique_ptr<CFX_Font> font = LoadUnicodeFallbackFace();
++  if (!font) {
++    return nullptr;
++  }
++
++  pdfium::span<const uint8_t> font_data = font->GetFontSpan();
++  auto char_codes_and_indices =
++      font->GetCharCodesAndIndices(pdfium::kMaximumSupplementaryCodePoint);
++  if (char_codes_and_indices.empty()) {
++    return nullptr;
++  }
++
++  ByteString name = font->GetBaseFontName();
++  if (name.IsEmpty()) {
++    name = CFX_Font::kUntitledFontName;
++  }
++
++  // Type0 parent using Identity-H.
++  auto font_dict = doc->NewIndirect<CPDF_Dictionary>();
++  font_dict->SetNewFor<CPDF_Name>("Type", "Font");
++  font_dict->SetNewFor<CPDF_Name>("Subtype", "Type0");
++  font_dict->SetNewFor<CPDF_Name>("Encoding", "Identity-H");
++  font_dict->SetNewFor<CPDF_Name>("BaseFont", name);
++
++  // CIDFontType2 descendant.
++  auto cid_font_dict = doc->NewIndirect<CPDF_Dictionary>();
++  cid_font_dict->SetNewFor<CPDF_Name>("Type", "Font");
++  cid_font_dict->SetNewFor<CPDF_Name>("Subtype", "CIDFontType2");
++  cid_font_dict->SetNewFor<CPDF_Name>("BaseFont", name);
++
++  auto cid_system_info = doc->NewIndirect<CPDF_Dictionary>();
++  cid_system_info->SetNewFor<CPDF_String>("Registry", "Adobe");
++  cid_system_info->SetNewFor<CPDF_String>("Ordering", "Identity");
++  cid_system_info->SetNewFor<CPDF_Number>("Supplement", 0);
++  cid_font_dict->SetNewFor<CPDF_Reference>("CIDSystemInfo", doc,
++                                            cid_system_info->GetObjNum());
++
++  // Embed the actual TrueType program. LoadSubstFace() exposes the selected
++  // system font bytes through GetFontSpan() on this PDFium revision.
++  auto descriptor = doc->NewIndirect<CPDF_Dictionary>();
++  descriptor->SetNewFor<CPDF_Name>("Type", "FontDescriptor");
++  descriptor->SetNewFor<CPDF_Name>("FontName", name);
++
++  int flags = pdfium::kFontStyleNonSymbolic;
++  if (font->IsFixedWidth()) {
++    flags |= pdfium::kFontStyleFixedPitch;
++  }
++  if (name.Contains("Serif")) {
++    flags |= pdfium::kFontStyleSerif;
++  }
++  if (font->IsItalic()) {
++    flags |= pdfium::kFontStyleItalic;
++  }
++  if (font->IsBold()) {
++    flags |= pdfium::kFontStyleForceBold;
++  }
++  descriptor->SetNewFor<CPDF_Number>("Flags", flags);
++  descriptor->SetRectFor("FontBBox",
++                         CFX_FloatRect(font->GetBBox().value_or(FX_RECT())));
++  descriptor->SetNewFor<CPDF_Number>("ItalicAngle",
++                                      font->IsItalic() ? -12 : 0);
++  descriptor->SetNewFor<CPDF_Number>("Ascent", font->GetAscent());
++  descriptor->SetNewFor<CPDF_Number>("Descent", font->GetDescent());
++  descriptor->SetNewFor<CPDF_Number>("CapHeight", font->GetAscent());
++  descriptor->SetNewFor<CPDF_Number>("StemV", font->IsBold() ? 120 : 70);
++
++  auto font_stream = doc->NewIndirect<CPDF_Stream>(font_data);
++  font_stream->GetMutableDict()->SetNewFor<CPDF_Number>(
++      "Length1", pdfium::checked_cast<int>(font_data.size()));
++  descriptor->SetNewFor<CPDF_Reference>("FontFile2", doc,
++                                         font_stream->GetObjNum());
++  cid_font_dict->SetNewFor<CPDF_Reference>("FontDescriptor", doc,
++                                            descriptor->GetObjNum());
++
++  std::map<uint32_t, uint32_t> widths;
++  std::multimap<uint32_t, uint32_t> to_unicode;
++  for (const auto& item : char_codes_and_indices) {
++    if (widths.find(item.glyph_index) == widths.end()) {
++      widths[item.glyph_index] = font->GetGlyphWidth(item.glyph_index);
++    }
++    // Use glyph id as CID. This mirrors PDFium's existing composite-font
++    // loader used by FPDFText_LoadFont(..., cid=true).
++    to_unicode.emplace(item.glyph_index, item.char_code);
++  }
++
++  cid_font_dict->SetNewFor<CPDF_Reference>(
++      "W", doc, doc->AddIndirectObject(CreateWidthsArray(widths)));
++
++  auto descendants = font_dict->SetNewFor<CPDF_Array>("DescendantFonts");
++  descendants->AppendNew<CPDF_Reference>(doc, cid_font_dict->GetObjNum());
++
++  font_dict->SetNewFor<CPDF_Reference>(
++      "ToUnicode", doc, doc->AddIndirectObject(LoadUnicode(to_unicode)));
++
++  return CPDF_DocPageData::FromDocument(doc)->GetFont(font_dict);
++}
++
++RetainPtr<CPDF_Font> GetOrCreateUnicodeFallbackFont(CPDF_Document* doc) {
++  auto* page_data = CPDF_DocPageData::FromDocument(doc);
++
++  // Reuse one embedded fallback per document instead of embedding the same
++  // system font again for every FreeText annotation.
++  RetainPtr<CPDF_Dictionary> root = doc->GetMutableRoot();
++  RetainPtr<CPDF_Dictionary> form =
++      root ? root->GetMutableDictFor(pdfium::catalog::kAcroForm) : nullptr;
++  RetainPtr<CPDF_Dictionary> dr =
++      form ? form->GetMutableDictFor("DR") : nullptr;
++  RetainPtr<CPDF_Dictionary> fonts =
++      dr ? dr->GetMutableDictFor("Font") : nullptr;
++
++  if (ValidateFontResourceDict(fonts.Get())) {
++    RetainPtr<CPDF_Dictionary> existing =
++        fonts->GetMutableDictFor(kUnicodeFallbackAlias);
++    if (existing) {
++      RetainPtr<CPDF_Font> cached = page_data->GetFont(existing);
++      if (cached) {
++        return cached;
++      }
++    }
++  }
++
++  RetainPtr<CPDF_Font> created = CreateUnicodeCompositeFallbackFont(doc);
++  if (created && ValidateFontResourceDict(fonts.Get()) &&
++      !fonts->KeyExist(kUnicodeFallbackAlias)) {
++    fonts->SetNewFor<CPDF_Reference>(kUnicodeFallbackAlias, doc,
++                                     created->GetFontDictObjNum());
++  }
++  return created;
++}
++
++}  // namespace
+ 
+ CPVT_FontMap::CPVT_FontMap(CPDF_Document* doc,
+                            RetainPtr<CPDF_Dictionary> pResDict,
+@@ -38,12 +181,17 @@ void CPVT_FontMap::SetupAnnotSysPDFFont() {
+     return;
+   }
+ 
+-  RetainPtr<CPDF_Font> pPDFFont =
++  RetainPtr<CPDF_Font> pPDFFont =
+       CPDF_InteractiveForm::AddNativeInteractiveFormFont(document_,
+                                                            &sys_font_alias_);
+   if (!pPDFFont) {
+-    return;
++    pPDFFont = GetOrCreateUnicodeFallbackFont(document_);
++    if (!pPDFFont) {
++      return;
++    }
++    sys_font_alias_ = kUnicodeFallbackAlias;
+   }
+ 
+   RetainPtr<CPDF_Dictionary> font_list = res_dict_->GetMutableDictFor("Font");

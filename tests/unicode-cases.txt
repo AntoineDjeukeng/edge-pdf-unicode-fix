@@ -1,0 +1,5 @@
+ASCII: abc XYZ 123
+Czech: ěščřžýáíéďťň
+Symbols: ☹ ☺ ✓ ✔ ★ → ← ↑ ↓
+Mixed: Hello čau ☹ ✓
+Emoji presentation (monochrome appearance expected): ☹️
